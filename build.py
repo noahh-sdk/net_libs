@@ -33,7 +33,7 @@ OPENSSL_TAG = "openssl-3.6.1"
 
 ANDROID_SDK_VERSION = 23
 MIN_IOS_VERSION = "14.0"
-MIN_MACOS_VERSION = "11.0"
+MIN_MACOS_VERSION = "10.15"
 
 REPOS = [
     (CURL_REPO, CURL_TAG),
@@ -99,7 +99,6 @@ class BuildConfig:
     generator: str = ""
     flatten_output: bool = False
     skip_lib_verify: bool = False
-    perl_path: Path | None = None
     rebuild_whitelist: set[str] = field(default_factory=set)
     output_path: Path = field(default_factory=Path)
     build_dir: Path = field(default_factory=Path)
@@ -177,16 +176,6 @@ class BuildConfig:
             cprint(f"Skipping build for {package_name} since it's not in the whitelist (--only)", Color.YELLOW)
             return False
         return True
-
-    def cross_compiling(self) -> bool:
-        name = pf.system().lower()
-        if name == "darwin":
-            return self.platform != "macos"
-        elif name == "windows":
-            return self.platform != "windows"
-        else:
-            # all other are cross compilation
-            return True
 
 def clone_package(repo: str, tag: str, path: Path):
     p = Popen(["git", "clone", "--no-checkout", repo, str(path)], stdout=PIPE, stderr=PIPE)
@@ -379,14 +368,11 @@ def build_openssl_one(path: Path, install_dir: Path, platform: str, config: Buil
         env["PATH"] = str(toolchain / "bin") + os.pathsep + env.get("PATH", "")
         args.append(f"-D__ANDROID_API__={ANDROID_SDK_VERSION}")
     elif platform == "windows":
-        perl = config.perl_path
+        perl = shutil.which("perl")
         if not perl:
-            raise BuildException("Perl is required to build OpenSSL on Windows but was not found in PATH or passed via --perl-path!")
+            raise BuildException("Perl is required to build OpenSSL on Windows but was not found in PATH!")
 
-        args.insert(0, str(perl))
-        perl_dir = str(perl.parent)
-        env["PATH"] = perl_dir + os.pathsep + env.get("PATH", "")
-
+        args.insert(0, perl)
     elif platform == "ios":
         env["CFLAGS"] = f"-isysroot {config.sysroot} -arch arm64 -mios-version-min={MIN_IOS_VERSION} -fembed-bitcode-marker"
         env["LDFLAGS"] = f"-isysroot {config.sysroot} -arch arm64 -mios-version-min={MIN_IOS_VERSION}"
@@ -395,8 +381,6 @@ def build_openssl_one(path: Path, install_dir: Path, platform: str, config: Buil
         cleanargs = [make, "distclean"]
         print(' '.join(cleanargs))
         subprocess.run(cleanargs, cwd=path, env=env, stderr=STDOUT, check=False)
-
-        args.append(f"-mmacosx-version-min={MIN_MACOS_VERSION}")
 
     # configure
     print(' '.join(args))
@@ -547,10 +531,10 @@ def build(config: BuildConfig):
         curl_args.append(f"-D{name.upper()}_LIBRARY={lib_path}")
 
     def add_linked_library_openssl(path: Path):
-        # verify existence
         inc_path = path / 'include'
         if not inc_path.exists():
             raise BuildException(f"Include directory for openssl not found at {inc_path}!")
+        curl_args.append(f"-DOPENSSL_INCLUDE_DIR={inc_path}")
 
         libs_path = path / 'lib'
         for component in ("ssl", "crypto"):
@@ -564,10 +548,7 @@ def build(config: BuildConfig):
             if not lib_path.exists():
                 raise BuildException(f"Library file for {component} (openssl) not found at {lib_path}!")
 
-        curl_args.append(f"-DOPENSSL_ROOT_DIR={path}")
-        if config.cross_compiling():
-            # :p
-            curl_args.extend(("-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH", "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH"))
+            curl_args.append(f"-DOPENSSL_{component.upper()}_LIBRARY={libs_path / libname}")
 
     # build the tls library
     if config.tls != TlsBackend.OpenSSL:
@@ -592,17 +573,6 @@ def build(config: BuildConfig):
             build_openssl(src_dir / "openssl", out_dir / "openssl", config)
             curl_args.append("-DCURL_USE_OPENSSL=ON")
             add_linked_library_openssl(out_dir / "openssl")
-
-    # patch c-ares to not use deprecated ucrt functions
-    if config.platform == "windows":
-        ares_cmake = src_dir / "c-ares" / "CMakeLists.txt"
-        cmake_text = ares_cmake.read_text()
-        for func in ("strcasecmp", "strcmpi", "strdup", "stricmp", "strncasecmp", "strncmpi", "strnicmp"):
-            cmake_text = cmake_text.replace(
-                f"CHECK_SYMBOL_EXISTS ({func}",
-                f"CHECK_SYMBOL_EXISTS (__invalid_func_{func}"
-            )
-        ares_cmake.write_text(cmake_text)
 
     # build c-ares
     if config.use_ares:
@@ -636,13 +606,12 @@ def build(config: BuildConfig):
     # patch zlib to not use deprecated ucrt functions
     gzgutsfile = src_dir / "zlib" / "gzguts.h"
     gzguts = gzgutsfile.read_text()
-    if "# define open _open" not in gzguts:
-        gzguts = gzguts + "\n#if defined(_WIN32)\n" \
-            "# define open _open\n" \
-            "# define read _read\n" \
-            "# define write _write\n" \
-            "# define close _close\n" \
-            "#endif\n"
+    gzguts = gzguts + "\n#if defined(_WIN32)\n" \
+        "# define open _open\n" \
+        "# define read _read\n" \
+        "# define write _write\n" \
+        "# define close _close\n" \
+        "#endif\n"
     gzgutsfile.write_text(gzguts)
 
     # build zlib
@@ -668,10 +637,9 @@ def build(config: BuildConfig):
     # this is a tiny fix because curl tries to link nghttp2 dynamically :(
     verfile = out_dir / "nghttp2" / "include" / "nghttp2" / "nghttp2ver.h"
     verfiletext = verfile.read_text()
-    if "#define NGHTTP2_STATICLIB 1" not in verfiletext:
-        verfiletext = verfiletext.replace(
-            "#endif", "#define NGHTTP2_STATICLIB 1\n\n#endif"
-        )
+    verfiletext = verfiletext.replace(
+        "#endif", "#define NGHTTP2_STATICLIB 1\n\n#endif"
+    )
     verfile.write_text(verfiletext)
 
     # build curl
@@ -718,9 +686,6 @@ def build(config: BuildConfig):
         ext = "*.lib" if config.platform == "windows" else "*.a"
         for path in config.output_path.glob(f"**/{ext}"):
             shutil.copy(path, config.output_path / path.name)
-        for path in config.output_path.glob("**/*.pdb"):
-            shutil.copy(path, config.output_path / path.name)
-
         curl_include = config.output_path / "curl" / "include"
         shutil.copytree(curl_include, config.output_path / "include", dirs_exist_ok=True)
 
@@ -744,7 +709,6 @@ if __name__ == "__main__":
     parser.add_argument("--flat-output", action="store_true", help="Only keep the output library files and curl includes at the end")
     parser.add_argument("--only", type=str, default="", help="Only rebuild the given packages, comma separated")
     parser.add_argument("--skip-lib-verify", action="store_true", help="Skip verification of git repos")
-    parser.add_argument("--perl-path", type=Path, required=False, help="The path to the Perl executable (if not in PATH)")
 
     args = parser.parse_args()
     if not args.platform:
@@ -772,7 +736,6 @@ if __name__ == "__main__":
     config.flatten_output = args.flat_output
     config.rebuild_whitelist = set(args.only.split(",")) if args.only else set()
     config.skip_lib_verify = args.skip_lib_verify
-    config.perl_path = args.perl_path or Path(shutil.which("perl") or "perl")
     if args.generator:
         config.generator = args.generator
     else:
