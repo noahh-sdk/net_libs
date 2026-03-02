@@ -34,6 +34,7 @@ OPENSSL_TAG = "openssl-3.6.1"
 ANDROID_SDK_VERSION = 23
 MIN_IOS_VERSION = "14.0"
 MIN_MACOS_VERSION = "11.0"
+OPENSSL_CLANG = True
 
 REPOS = [
     (CURL_REPO, CURL_TAG),
@@ -63,6 +64,9 @@ _orig_print = builtins.print
 def print(*args, **kwargs):
     kwargs.setdefault("flush", True)
     _orig_print(*args, **kwargs)
+
+def strpath(p: Path):
+    return str(p.absolute()).replace("\\", "/")
 
 class TlsBackend(Enum):
     OpenSSL = auto()
@@ -99,6 +103,7 @@ class BuildConfig:
     generator: str = ""
     flatten_output: bool = False
     skip_lib_verify: bool = False
+    lto: bool = False
     perl_path: Path | None = None
     rebuild_whitelist: set[str] = field(default_factory=set)
     output_path: Path = field(default_factory=Path)
@@ -109,7 +114,6 @@ class BuildConfig:
         tls: TlsBackend | None = None
         args = []
         env = {}
-        sysroot = None
 
         plat = plat.lower()
         match plat:
@@ -130,20 +134,18 @@ class BuildConfig:
                 args.append(f"-DCMAKE_OSX_DEPLOYMENT_TARGET={MIN_IOS_VERSION}")
                 args.append("-DCMAKE_IOS_INSTALL_COMBINED=YES")
                 args.append("-DCMAKE_SYSTEM_NAME=iOS")
-
-                # find the sysroot and clang paths
-                xcrun = shutil.which("xcrun") or "xcrun"
-                sdk_path = subprocess.check_output([xcrun, "--sdk", "iphoneos", "--show-sdk-path"], text=True).strip()
-                cc_path = subprocess.check_output([xcrun, "--sdk", "iphoneos", "-f", "clang"], text=True).strip()
-
-                sysroot = Path(sdk_path)
-                env["CC"] = cc_path
-
-                args.append(f"-DCMAKE_OSX_SYSROOT={sdk_path}")
             case _:
                 raise ValueError(f"Unsupported platform: {plat}")
 
-        return cls(tls, True, plat, "Release", args, env, sysroot=sysroot)
+        ret = cls(tls, True, plat, "Release", args, env)
+        ret.post_setup()
+        return ret
+
+    def post_setup(self):
+        if self.platform == "ios":
+            self.sysroot = self._find("sysroot")
+            self.cmake_env["CC"] = self.find_cc()
+            self.cmake_args.append(f"-DCMAKE_OSX_SYSROOT={self.sysroot}")
 
     def target_triple(self) -> str:
         match self.platform:
@@ -187,6 +189,62 @@ class BuildConfig:
         else:
             # all other are cross compilation
             return True
+
+    def find_cc(self) -> str:
+        return strpath(self._find("cc"))
+
+    def find_cxx(self) -> str:
+        return strpath(self._find("cxx"))
+
+    def find_ar(self) -> str:
+        return strpath(self._find("ar"))
+
+    def find_ranlib(self) -> str:
+        return strpath(self._find("ranlib"))
+
+    def find_sysroot(self) -> str:
+        return strpath(self._find("sysroot"))
+
+    def _find(self, what: str) -> Path:
+        if "android" in self.platform:
+            assert self.ndk_path
+            toolchain = find_android_toolchain(self.ndk_path)
+            bin = toolchain / "bin"
+
+            if what == "ar" or what == "ranlib":
+                return bin / f"llvm-{what}"
+
+            triple = self.target_triple()
+            llvmtriple = triple.replace("armv7", "armv7a")
+
+            suffix = "" if what == "cc" else "++"
+            return toolchain / "bin" / f"{llvmtriple}{ANDROID_SDK_VERSION}-clang{suffix}"
+        elif self.platform == "ios" or self.platform == "macos":
+            xcrun = shutil.which("xcrun") or "xcrun"
+            sdk = "iphoneos" if self.platform == "ios" else "macosx"
+
+            if what == "sysroot":
+                return Path(subprocess.check_output([xcrun, "--sdk", sdk, "--show-sdk-path"], text=True).strip())
+            else:
+                whatmap = {
+                    "cc": "clang",
+                    "cxx": "clang++",
+                }
+                return Path(subprocess.check_output([xcrun, "--sdk", sdk, "-f", whatmap.get(what, what)], text=True).strip())
+        elif self.platform == "windows":
+            whatmap = {
+                "cc": "clang-cl",
+                "cxx": "clang-cl",
+                "ar": "llvm-lib",
+                "ranlib": "llvm-lib",
+            }
+            what = whatmap.get(what, what)
+            return Path(shutil.which(what) or what)
+
+        # default, unknown
+        cprint(f"Could not find tool '{what}' for platform '{self.platform}', falling back to path-based resolution", Color.YELLOW)
+        return Path(shutil.which(what) or what)
+
 
 def clone_package(repo: str, tag: str, path: Path):
     p = Popen(["git", "clone", "--no-checkout", repo, str(path)], stdout=PIPE, stderr=PIPE)
@@ -288,13 +346,11 @@ def build_rustls(path: Path, install_dir: Path, config: BuildConfig):
     env.update(config.cmake_env)
     if "android" in config.platform:
         assert config.ndk_path and config.ndk_path.exists(), "NDK path must be specified and exist for Android builds!"
-        toolchain = find_android_toolchain(config.ndk_path)
 
         triple = config.target_triple()
-        llvmtriple = triple.replace("armv7", "armv7a")
-        env["CC"] = str(toolchain / "bin" / f"{llvmtriple}{ANDROID_SDK_VERSION}-clang")
-        env["CXX"] = str(toolchain / "bin" / f"{llvmtriple}{ANDROID_SDK_VERSION}-clang++")
-        env["AR"] = str(toolchain / "bin" / "llvm-ar")
+        env["CC"] = config.find_cc()
+        env["CXX"] = config.find_cxx()
+        env["AR"] = config.find_ar()
         env["CARGO_TARGET_" + triple.upper().replace("-", "_") + "_LINKER"] = env["CC"]
 
     if config.platform == "macos":
@@ -347,10 +403,17 @@ def build_rustls(path: Path, install_dir: Path, config: BuildConfig):
 def build_openssl_one(path: Path, install_dir: Path, platform: str, config: BuildConfig):
     make = shutil.which("make") or "make"
 
+    # run make distclean before builds, otherwise some issues may arise
+    if platform != "windows":
+        cleanargs = [make, "distclean"]
+        print(' '.join(cleanargs))
+        subprocess.run(cleanargs, cwd=path, stderr=STDOUT, check=False)
+
     # pain begins here..
     env = os.environ.copy()
     env.update(config.cmake_env)
 
+    cflags = []
     args = [str(path / "Configure")]
     mapping = {
         "android32": "android-arm",
@@ -363,6 +426,8 @@ def build_openssl_one(path: Path, install_dir: Path, platform: str, config: Buil
     args.append(mapping[platform])
     args.append(f"--prefix={install_dir}")
     args.append(f"--openssldir={install_dir}/ssl")
+
+    # dont build things we will not use
     args.append("no-shared")
     args.append("no-docs")
     args.append("no-tests")
@@ -371,6 +436,19 @@ def build_openssl_one(path: Path, install_dir: Path, platform: str, config: Buil
     args.append("no-engine")
     args.append("no-async")
     args.append("no-makedepend")
+    args.append("no-deprecated")
+
+    args.append("no-ssl3")
+    args.append("no-comp")
+    args.append("no-idea")
+    args.append("no-md2")
+    args.append("no-rc4")
+    args.append("no-rc2")
+    args.append("no-fips")
+    args.append("no-srp")
+    # required for android, otherwise we get
+    # relocation R_AARCH64_ADR_PREL_PG_HI21 cannot be used against symbol 'ssl_undefined_function'; recompile with -fPIC
+    args.append("enable-pic")
 
     if "android" in platform:
         assert config.ndk_path
@@ -378,6 +456,8 @@ def build_openssl_one(path: Path, install_dir: Path, platform: str, config: Buil
         toolchain = find_android_toolchain(config.ndk_path)
         env["PATH"] = str(toolchain / "bin") + os.pathsep + env.get("PATH", "")
         args.append(f"-D__ANDROID_API__={ANDROID_SDK_VERSION}")
+        cflags.append("-Wno-macro-redefined")
+
     elif platform == "windows":
         perl = config.perl_path
         if not perl:
@@ -387,16 +467,24 @@ def build_openssl_one(path: Path, install_dir: Path, platform: str, config: Buil
         perl_dir = str(perl.parent)
         env["PATH"] = perl_dir + os.pathsep + env.get("PATH", "")
 
+        if OPENSSL_CLANG:
+            env["CC"] = "clang-cl"
+            env["CXX"] = "clang-cl"
+            env["AR"] = "llvm-lib"
+            env["LD"] = "clang-cl"
+            # clang-cl does not create a .pdb file, so let's make a dummy file so the build doesn't fail
+            (path / "ossl_static.pdb").touch()
+
     elif platform == "ios":
-        env["CFLAGS"] = f"-isysroot {config.sysroot} -arch arm64 -mios-version-min={MIN_IOS_VERSION} -fembed-bitcode-marker"
+        cflags.extend(f"-isysroot {config.sysroot} -arch arm64 -mios-version-min={MIN_IOS_VERSION}".split())
         env["LDFLAGS"] = f"-isysroot {config.sysroot} -arch arm64 -mios-version-min={MIN_IOS_VERSION}"
     elif "macos" in platform:
-        # run make distclean before builds, otherwise first arch will mess up the second one
-        cleanargs = [make, "distclean"]
-        print(' '.join(cleanargs))
-        subprocess.run(cleanargs, cwd=path, env=env, stderr=STDOUT, check=False)
-
         args.append(f"-mmacosx-version-min={MIN_MACOS_VERSION}")
+
+    if config.lto:
+        cflags.append("-flto=thin")
+
+    env["CFLAGS"] = env.get("CFLAGS", "") + " " + " ".join(cflags)
 
     # configure
     print(' '.join(args))
@@ -420,6 +508,11 @@ nmake install_sw
 exit /b %errorlevel%
 """)
         subprocess.run(["cmd.exe", "/c", str(wrapper)], cwd=path, env=env, check=True)
+
+        # delete the dummy pdb file
+        if OPENSSL_CLANG:
+            pdb_path = (install_dir / "lib" / "ossl_static.pdb")
+            pdb_path.unlink(True)
     else:
         nproc = os.cpu_count() or 1
         build_args = [make, f"-j{nproc}"]
@@ -478,6 +571,19 @@ def build_one(path: Path, install_dir: Path, config: BuildConfig, extra_args: li
     cmake_args = config.cmake_args + (extra_args if extra_args else [])
     cmake_args.append(f"-DCMAKE_INSTALL_PREFIX={install_dir}")
     cmake_args.append(f"-DCMAKE_BUILD_TYPE={config.profile}")
+
+    if config.lto:
+        cmake_args.append("-DCMAKE_CXX_FLAGS=-flto=thin")
+        cmake_args.append("-DCMAKE_C_FLAGS=-flto=thin")
+        cmake_args.append(f"-DCMAKE_AR={config.find_ar()}")
+        cmake_args.append(f"-DCMAKE_RANLIB={config.find_ranlib()}")
+
+    if config.platform == "windows":
+        # use clang-cl
+        cmake_args.append(f"-DCMAKE_C_COMPILER={config.find_cc()}")
+        cmake_args.append(f"-DCMAKE_CXX_COMPILER={config.find_cxx()}")
+        cmake_args.append(f"-DCMAKE_LINKER=lld-link")
+
     if config.generator:
         cmake_args.extend(("-G", config.generator))
     cmake_args.extend(("-S", str(path)))
@@ -690,6 +796,7 @@ def build(config: BuildConfig):
         "-DCURL_DISABLE_RTSP=ON",
         "-DCURL_DISABLE_MQTT=ON",
         "-DCURL_DISABLE_NTLM=ON",
+        "-DCURL_DISABLE_SRP=ON",
         "-DCURL_DISABLE_WEBSOCKETS=ON",
         "-DCURL_DISABLE_KERBEROS_AUTH=ON",
         "-DCURL_DISABLE_NEGOTIATE_AUTH=ON",
@@ -715,18 +822,32 @@ def build(config: BuildConfig):
     if config.flatten_output:
         cprint("Flattening output directory..", Color.BLUE)
 
+        include_dir = config.output_path / "include"
+        include_dir.mkdir(exist_ok=True)
+
         ext = "*.lib" if config.platform == "windows" else "*.a"
         for path in config.output_path.glob(f"**/{ext}"):
             shutil.copy(path, config.output_path / path.name)
         for path in config.output_path.glob("**/*.pdb"):
             shutil.copy(path, config.output_path / path.name)
 
-        curl_include = config.output_path / "curl" / "include"
-        shutil.copytree(curl_include, config.output_path / "include", dirs_exist_ok=True)
+        for entry in list(config.output_path.iterdir()):
+            if not entry.is_dir() or entry.name == "include":
+                continue
+            inc = entry / "include"
+            if not inc.exists() or not inc.is_dir():
+                continue
 
-        dirs = list(config.output_path.iterdir())
-        for d in dirs:
-            if d.is_dir() and d.name not in ("include",):
+            for path in inc.rglob('*'):
+                if not path.is_file():
+                    continue
+                rel_path = path.relative_to(inc)
+                dest_path = include_dir / rel_path
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, dest_path)
+
+        for d in list(config.output_path.iterdir()):
+            if d.name != "include" and d.is_dir():
                 shutil.rmtree(d)
 
 if __name__ == "__main__":
@@ -742,6 +863,7 @@ if __name__ == "__main__":
     parser.add_argument("--toolchain", type=str, required=False, help="The CMake toolchain file to use (for cross-compilation)")
     parser.add_argument("--splat", type=str, required=False, help="Splat dir for cross-compiling to Windows, if passed, configures other cross-compilation things as well")
     parser.add_argument("--flat-output", action="store_true", help="Only keep the output library files and curl includes at the end")
+    parser.add_argument("--lto", action="store_true", help="Whether to enable LTO")
     parser.add_argument("--only", type=str, default="", help="Only rebuild the given packages, comma separated")
     parser.add_argument("--skip-lib-verify", action="store_true", help="Skip verification of git repos")
     parser.add_argument("--perl-path", type=Path, required=False, help="The path to the Perl executable (if not in PATH)")
@@ -770,6 +892,7 @@ if __name__ == "__main__":
     config.build_dir = args.build_dir.absolute()
     config.profile = "Debug" if args.debug else "Release"
     config.flatten_output = args.flat_output
+    config.lto = args.lto
     config.rebuild_whitelist = set(args.only.split(",")) if args.only else set()
     config.skip_lib_verify = args.skip_lib_verify
     config.perl_path = args.perl_path or Path(shutil.which("perl") or "perl")
