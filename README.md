@@ -49,3 +49,4 @@ Compiling for Windows on non-Windows platforms requires a cross-compilation tool
 TOOLS=~/.local/share/Noahh/cross-tools/
 python build.py -p windows --toolchain $TOOLS/clang-msvc-sdk/clang-msvc.cmake --splat $TOOLS/splat
 ```
+
